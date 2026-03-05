@@ -1,24 +1,28 @@
 import express from "express";
-import OpenAI from "openai";
+import cors from "cors";
 import dotenv from "dotenv";
+import OpenAI from "openai";
 
 dotenv.config();
 
 const app = express();
+app.use(cors());
 app.use(express.json());
 
-const client = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
+// Initialize OpenAI
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
 });
 
+// Invoice analysis endpoint
 app.post("/analyze-invoice", async (req, res) => {
 
   const invoice = req.body;
 
   try {
 
-    const response = await client.chat.completions.create({
-      model: "gpt-4.1",
+    const response = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
       messages: [
         {
           role: "system",
@@ -42,6 +46,7 @@ app.post("/analyze-invoice", async (req, res) => {
 
 });
 
+// Railway dynamic port
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
