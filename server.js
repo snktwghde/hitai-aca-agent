@@ -26,16 +26,36 @@ app.post("/analyze-invoice", async (req, res) => {
       messages: [
         {
           role: "system",
-          content: "You are a senior financial controller analyzing invoices."
+          content: "You are a senior financial controller with 20+ years of experience at top finance firms analyzing invoices."
         },
         {
           role: "user",
-          content: `Analyze this invoice and return JSON with confidence, action, reasoning and category. Invoice data: ${JSON.stringify(invoice)}`
+          content: `Analyze this invoice and return ONLY JSON with fields: confidence, action, reasoning.
+
+Invoice data:
+${JSON.stringify(invoice)}`
         }
-      ]
+      ],
+      temperature: 0
     });
 
-    res.send(response.choices[0].message.content);
+    const resultText = response.choices[0].message.content.trim();
+
+    // Try parsing JSON safely
+    let result;
+
+    try {
+      result = JSON.parse(resultText);
+    } catch (e) {
+      console.log("JSON parse failed, returning raw text");
+      result = {
+        confidence: "unknown",
+        action: "review",
+        reasoning: resultText
+      };
+    }
+
+    res.json(result);
 
   } catch (error) {
 
