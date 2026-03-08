@@ -26,7 +26,7 @@ app.post("/analyze-invoice", async (req, res) => {
       messages: [
         {
           role: "system",
-          content: "You are a senior financial controller with 20+ years of experience at top finance firms analyzing invoices."
+          content: "You are a senior financial controller analyzing invoices."
         },
         {
           role: "user",
@@ -41,17 +41,23 @@ ${JSON.stringify(invoice)}`
 
     const resultText = response.choices[0].message.content.trim();
 
-    // Try parsing JSON safely
+    // Remove markdown code blocks if present
+    const cleaned = resultText
+      .replace(/```json/g, "")
+      .replace(/```/g, "")
+      .trim();
+
     let result;
 
     try {
-      result = JSON.parse(resultText);
+      result = JSON.parse(cleaned);
     } catch (e) {
       console.log("JSON parse failed, returning raw text");
+
       result = {
         confidence: "unknown",
         action: "review",
-        reasoning: resultText
+        reasoning: cleaned
       };
     }
 
