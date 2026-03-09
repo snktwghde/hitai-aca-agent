@@ -50,26 +50,51 @@ ${JSON.stringify(invoice)}`
     let result;
 
     try {
+
       result = JSON.parse(cleaned);
+
+      // Convert numeric confidence → category
+      if (typeof result.confidence === "number") {
+
+        if (result.confidence >= 0.8) {
+          result.confidence = "high";
+        } 
+        else if (result.confidence >= 0.5) {
+          result.confidence = "medium";
+        } 
+        else {
+          result.confidence = "low";
+        }
+
+      }
+
     } catch (e) {
-      console.log("JSON parse failed, returning raw text");
+
+      console.log("JSON parse failed, returning fallback response");
 
       result = {
-        confidence: "unknown",
+        confidence: "medium",
         action: "review",
         reasoning: cleaned
       };
+
     }
 
     res.json(result);
 
   } catch (error) {
 
-    console.error(error);
+    console.error("ACA Error:", error);
+
     res.status(500).send("Error analyzing invoice");
 
   }
 
+});
+
+// Health check endpoint (optional but useful)
+app.get("/", (req, res) => {
+  res.send("ACA Agent Running");
 });
 
 // Railway dynamic port
