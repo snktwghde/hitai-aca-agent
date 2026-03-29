@@ -245,12 +245,22 @@ Duplicate: ${possibleDuplicate}
     );
 
     // -------------------------------
-    // EMAIL
+    // RESPOND IMMEDIATELY (don't wait for email)
+    // -------------------------------
+    res.json({
+      message: "Invoice processed",
+      tenant: tenant.name,
+      decision: result.action,
+      confidence: confidenceLevel
+    });
+
+    // -------------------------------
+    // EMAIL (fire-and-forget, non-blocking)
     // -------------------------------
     const approveUrl = `http://localhost:3000/approve?token=${token}`;
     const rejectUrl = `http://localhost:3000/reject?token=${token}`;
 
-    await transporter.sendMail({
+    transporter.sendMail({
       from: process.env.EMAIL_USER,
       to: approver,
       subject: `Invoice Approval — ${tenant.name}`,
@@ -266,11 +276,11 @@ Duplicate: ${possibleDuplicate}
 
         <p>This link expires in 1 hour</p>
       `
+    }).then(() => {
+      console.log("Email sent to:", approver);
+    }).catch((emailErr) => {
+      console.error("Email failed (non-blocking):", emailErr.message);
     });
-
-    console.log("Email sent to:", approver);
-
-    res.json({ message: "Secure email sent", tenant: tenant.name });
 
   } catch (error) {
     console.error("ACA Error:", error);
