@@ -30,10 +30,13 @@ const pool = new Pool({
 });
 
 // -------------------------------
-// EMAIL
+// EMAIL (IPv4 forced for Railway)
 // -------------------------------
 const transporter = nodemailer.createTransport({
-  service: "gmail",
+  host: "smtp.gmail.com",
+  port: 465,
+  secure: true,
+  family: 4,
   auth: {
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_PASS
@@ -43,8 +46,6 @@ const transporter = nodemailer.createTransport({
 // -------------------------------
 // TENANT VALIDATION HELPER
 // -------------------------------
-// Validates tenant_id exists and is active.
-// Returns the tenant row or null.
 async function validateTenant(tenantId) {
   if (!tenantId) return null;
 
@@ -73,9 +74,6 @@ app.post("/analyze-invoice", async (req, res) => {
     // -------------------------------
     // TENANT CHECK
     // -------------------------------
-    // tenant_id comes from request body for now.
-    // When JWT auth is added later, extract from token instead:
-    //   const tenantId = req.auth.tenant_id;
     const tenantId = invoice.tenant_id;
 
     const tenant = await validateTenant(tenantId);
@@ -280,9 +278,6 @@ Duplicate: ${possibleDuplicate}
 // -------------------------------
 // APPROVE (SECURE)
 // -------------------------------
-// Token-based lookup — no tenant_id in the URL.
-// Token is 256-bit random, unique across all tenants.
-// Row already has tenant_id from insert time.
 app.get("/approve", async (req, res) => {
 
   const { token } = req.query;
@@ -312,7 +307,6 @@ app.get("/approve", async (req, res) => {
     [token]
   );
 
-  // Audit log — tenant_id pulled from the invoice row
   await pool.query(
     `INSERT INTO audit_log (event, metadata, tenant_id)
      VALUES ($1, $2, $3)`,
@@ -361,7 +355,6 @@ app.get("/reject", async (req, res) => {
     [token]
   );
 
-  // Audit log — tenant_id pulled from the invoice row
   await pool.query(
     `INSERT INTO audit_log (event, metadata, tenant_id)
      VALUES ($1, $2, $3)`,
