@@ -5,6 +5,10 @@ import OpenAI from "openai";
 import pkg from "pg";
 import nodemailer from "nodemailer";
 import crypto from "crypto";
+import dns from "dns";
+
+// Force IPv4 for all DNS lookups (Railway can't reach IPv6)
+dns.setDefaultResultOrder("ipv4first");
 
 dotenv.config();
 
@@ -30,13 +34,12 @@ const pool = new Pool({
 });
 
 // -------------------------------
-// EMAIL (IPv4 forced for Railway)
+// EMAIL
 // -------------------------------
 const transporter = nodemailer.createTransport({
   host: "smtp.gmail.com",
   port: 465,
   secure: true,
-  family: 4,
   auth: {
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_PASS
