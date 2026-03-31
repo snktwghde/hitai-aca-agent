@@ -64,7 +64,17 @@ app.post("/analyze-invoice", async (req, res) => {
 
   try {
 
-    console.log("Incoming Invoice:", invoice);
+    // -------------------------------
+    // INPUT VALIDATION [FIX #5]
+    // -------------------------------
+    if (!invoice.vendor || !invoice.amount || !invoice.date) {
+      return res.status(400).json({ error: "Missing required fields: vendor, amount, date" });
+    }
+
+    const amount = parseFloat(invoice.amount);
+    if (isNaN(amount) || amount <= 0) {
+      return res.status(400).json({ error: "amount must be a positive number" });
+    }
 
     // -------------------------------
     // TENANT CHECK
@@ -76,33 +86,43 @@ app.post("/analyze-invoice", async (req, res) => {
       return res.status(400).json({ error: "Missing or invalid tenant_id" });
     }
 
+    console.log("Incoming Invoice:", invoice.invoice_id, invoice.vendor, amount);
+
     // -------------------------------
     // Vendor History (tenant-scoped)
     // -------------------------------
     const vendorHistory = await pool.query(
-      `SELECT AVG(amount) as avg_amount, COUNT(*) as total_invoices
+      `SELECT AVG(amount) as avg_amount
        FROM invoices WHERE vendor=$1 AND tenant_id=$2`,
       [invoice.vendor, tenantId]
     );
 
     const avgAmount = parseFloat(vendorHistory.rows[0].avg_amount) || 0;
-    const totalInvoices = parseInt(vendorHistory.rows[0].total_invoices) || 0;
 
     // -------------------------------
-    // Duplicate Check (tenant-scoped)
+    // Duplicate Check (tenant-scoped) [FIX #4]
     // -------------------------------
     const duplicateCheck = await pool.query(
-      `SELECT * FROM invoices
+      `SELECT 1 FROM invoices
        WHERE vendor=$1 AND amount=$2 AND tenant_id=$3
-       AND invoice_date > NOW() - interval '30 days'`,
-      [invoice.vendor, invoice.amount, tenantId]
+       AND invoice_date > NOW() - interval '30 days'
+       LIMIT 1`,
+      [invoice.vendor, amount, tenantId]
     );
 
     const possibleDuplicate = duplicateCheck.rows.length > 0;
 
     // -------------------------------
-    // OpenAI Decision
+    // OpenAI Decision [FIX #6 — only send what LLM needs]
     // -------------------------------
+    const llmPayload = {
+      invoice_id: invoice.invoice_id,
+      vendor: invoice.vendor,
+      amount: amount,
+      department: invoice.department,
+      date: invoice.date
+    };
+
     const response = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
@@ -126,7 +146,7 @@ Duplicate: ${possibleDuplicate}
         },
         {
           role: "user",
-          content: JSON.stringify(invoice)
+          content: JSON.stringify(llmPayload)
         }
       ],
       temperature: 0
@@ -159,23 +179,24 @@ Duplicate: ${possibleDuplicate}
     // -------------------------------
     // CONFIDENCE FIX
     // -------------------------------
-    let confidenceScore = typeof result.confidence === "number" ? result.confidence : 0.6;
+    const confidenceScore = typeof result.confidence === "number" ? result.confidence : 0.6;
 
-    let confidenceLevel =
+    const confidenceLevel =
       confidenceScore >= 0.8 ? "high" :
       confidenceScore >= 0.5 ? "medium" : "low";
 
     // -------------------------------
-    // HARD RULES
+    // HARD RULES [FIX #10 — duplicate wins over amount]
     // -------------------------------
+    if (avgAmount > 0 && amount > 3 * avgAmount) {
+      result.action = "review";
+      result.reasoning = "Amount exceeds vendor average";
+    }
+
+    // Duplicate check runs LAST so it always wins
     if (possibleDuplicate) {
       result.action = "reject";
       result.reasoning = "Duplicate invoice detected";
-    }
-
-    if (avgAmount > 0 && invoice.amount > 3 * avgAmount) {
-      result.action = "review";
-      result.reasoning = "Amount exceeds vendor average";
     }
 
     console.log("Final Decision:", result);
@@ -203,7 +224,7 @@ Duplicate: ${possibleDuplicate}
       [
         invoice.invoice_id,
         invoice.vendor,
-        invoice.amount,
+        amount,
         invoice.department,
         invoice.date,
         result.action,
@@ -228,7 +249,7 @@ Duplicate: ${possibleDuplicate}
         JSON.stringify({
           invoice_id: invoice.invoice_id,
           vendor: invoice.vendor,
-          amount: invoice.amount,
+          amount: amount,
           decision: result.action,
           confidence: confidenceLevel
         }),
@@ -247,10 +268,11 @@ Duplicate: ${possibleDuplicate}
     });
 
     // -------------------------------
-    // EMAIL (fire-and-forget via Resend HTTP API)
+    // EMAIL (fire-and-forget via Resend) [FIX #1 — use APP_URL]
     // -------------------------------
-    const approveUrl = `http://localhost:3000/approve?token=${token}`;
-    const rejectUrl = `http://localhost:3000/reject?token=${token}`;
+    const baseUrl = process.env.APP_URL || "http://localhost:3000";
+    const approveUrl = `${baseUrl}/approve?token=${token}`;
+    const rejectUrl = `${baseUrl}/reject?token=${token}`;
 
     resend.emails.send({
       from: "Embed ACA <onboarding@resend.dev>",
@@ -260,7 +282,7 @@ Duplicate: ${possibleDuplicate}
         <h2>Invoice Approval Needed</h2>
         <p><b>Company:</b> ${tenant.name}</p>
         <p><b>Vendor:</b> ${invoice.vendor}</p>
-        <p><b>Amount:</b> ${invoice.amount}</p>
+        <p><b>Amount:</b> ${amount}</p>
         <p><b>AI Decision:</b> ${result.action}</p>
 
         <a href="${approveUrl}">Approve</a><br/><br/>
@@ -276,12 +298,12 @@ Duplicate: ${possibleDuplicate}
 
   } catch (error) {
     console.error("ACA Error:", error);
-    res.status(500).send(error.message);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
 // -------------------------------
-// APPROVE (SECURE)
+// APPROVE (SECURE) [FIX #2 — try/catch, FIX #3 — invalidate token]
 // -------------------------------
 app.get("/approve", async (req, res) => {
 
@@ -291,45 +313,55 @@ app.get("/approve", async (req, res) => {
     return res.send("Missing token ❌");
   }
 
-  const result = await pool.query(
-    `SELECT * FROM invoices 
-     WHERE approval_token=$1
-     AND token_expiry > NOW()`,
-    [token]
-  );
+  try {
 
-  if (result.rows.length === 0) {
-    return res.send("Invalid or Expired token ❌");
+    const result = await pool.query(
+      `SELECT * FROM invoices 
+       WHERE approval_token=$1
+       AND token_expiry > NOW()
+       AND approval_status='pending'`,
+      [token]
+    );
+
+    if (result.rows.length === 0) {
+      return res.send("Invalid, expired, or already processed token ❌");
+    }
+
+    const invoice = result.rows[0];
+
+    // Update status AND invalidate token to prevent replay
+    await pool.query(
+      `UPDATE invoices
+       SET approval_status='approved',
+           approved_at=NOW(),
+           approval_token=NULL
+       WHERE approval_token=$1`,
+      [token]
+    );
+
+    await pool.query(
+      `INSERT INTO audit_log (event, metadata, tenant_id)
+       VALUES ($1, $2, $3)`,
+      [
+        "invoice_approved",
+        JSON.stringify({
+          invoice_id: invoice.invoice_id,
+          approved_by: invoice.approved_by
+        }),
+        invoice.tenant_id
+      ]
+    );
+
+    res.send("✅ Approved securely");
+
+  } catch (error) {
+    console.error("Approve Error:", error);
+    res.status(500).send("Something went wrong. Please try again.");
   }
-
-  const invoice = result.rows[0];
-
-  await pool.query(
-    `UPDATE invoices
-     SET approval_status='approved',
-         approved_at=NOW()
-     WHERE approval_token=$1`,
-    [token]
-  );
-
-  await pool.query(
-    `INSERT INTO audit_log (event, metadata, tenant_id)
-     VALUES ($1, $2, $3)`,
-    [
-      "invoice_approved",
-      JSON.stringify({
-        invoice_id: invoice.invoice_id,
-        approved_by: invoice.approved_by
-      }),
-      invoice.tenant_id
-    ]
-  );
-
-  res.send("✅ Approved securely");
 });
 
 // -------------------------------
-// REJECT (SECURE)
+// REJECT (SECURE) [FIX #2 — try/catch, FIX #3 — invalidate token]
 // -------------------------------
 app.get("/reject", async (req, res) => {
 
@@ -339,41 +371,51 @@ app.get("/reject", async (req, res) => {
     return res.send("Missing token ❌");
   }
 
-  const result = await pool.query(
-    `SELECT * FROM invoices 
-     WHERE approval_token=$1
-     AND token_expiry > NOW()`,
-    [token]
-  );
+  try {
 
-  if (result.rows.length === 0) {
-    return res.send("Invalid or Expired token ❌");
+    const result = await pool.query(
+      `SELECT * FROM invoices 
+       WHERE approval_token=$1
+       AND token_expiry > NOW()
+       AND approval_status='pending'`,
+      [token]
+    );
+
+    if (result.rows.length === 0) {
+      return res.send("Invalid, expired, or already processed token ❌");
+    }
+
+    const invoice = result.rows[0];
+
+    // Update status AND invalidate token to prevent replay
+    await pool.query(
+      `UPDATE invoices
+       SET approval_status='rejected',
+           approved_at=NOW(),
+           approval_token=NULL
+       WHERE approval_token=$1`,
+      [token]
+    );
+
+    await pool.query(
+      `INSERT INTO audit_log (event, metadata, tenant_id)
+       VALUES ($1, $2, $3)`,
+      [
+        "invoice_rejected",
+        JSON.stringify({
+          invoice_id: invoice.invoice_id,
+          rejected_by: invoice.approved_by
+        }),
+        invoice.tenant_id
+      ]
+    );
+
+    res.send("❌ Rejected securely");
+
+  } catch (error) {
+    console.error("Reject Error:", error);
+    res.status(500).send("Something went wrong. Please try again.");
   }
-
-  const invoice = result.rows[0];
-
-  await pool.query(
-    `UPDATE invoices
-     SET approval_status='rejected',
-         approved_at=NOW()
-     WHERE approval_token=$1`,
-    [token]
-  );
-
-  await pool.query(
-    `INSERT INTO audit_log (event, metadata, tenant_id)
-     VALUES ($1, $2, $3)`,
-    [
-      "invoice_rejected",
-      JSON.stringify({
-        invoice_id: invoice.invoice_id,
-        rejected_by: invoice.approved_by
-      }),
-      invoice.tenant_id
-    ]
-  );
-
-  res.send("❌ Rejected securely");
 });
 
 // -------------------------------
