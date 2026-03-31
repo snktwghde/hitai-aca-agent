@@ -3,9 +3,9 @@ import cors from "cors";
 import dotenv from "dotenv";
 import OpenAI from "openai";
 import pkg from "pg";
-import nodemailer from "nodemailer";
 import crypto from "crypto";
 import dns from "dns";
+import { Resend } from "resend";
 
 // Force IPv4 for all DNS lookups (Railway can't reach IPv6)
 dns.setDefaultResultOrder("ipv4first");
@@ -34,17 +34,9 @@ const pool = new Pool({
 });
 
 // -------------------------------
-// EMAIL
+// EMAIL (Resend — HTTP-based, no SMTP)
 // -------------------------------
-const transporter = nodemailer.createTransport({
-  host: "smtp.gmail.com",
-  port: 465,
-  secure: true,
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS
-  }
-});
+const resend = new Resend(process.env.RESEND_API_KEY);
 
 // -------------------------------
 // TENANT VALIDATION HELPER
@@ -255,14 +247,14 @@ Duplicate: ${possibleDuplicate}
     });
 
     // -------------------------------
-    // EMAIL (fire-and-forget, non-blocking)
+    // EMAIL (fire-and-forget via Resend HTTP API)
     // -------------------------------
     const approveUrl = `http://localhost:3000/approve?token=${token}`;
     const rejectUrl = `http://localhost:3000/reject?token=${token}`;
 
-    transporter.sendMail({
-      from: process.env.EMAIL_USER,
-      to: approver,
+    resend.emails.send({
+      from: "Embed ACA <onboarding@resend.dev>",
+      to: [approver],
       subject: `Invoice Approval — ${tenant.name}`,
       html: `
         <h2>Invoice Approval Needed</h2>
@@ -276,10 +268,10 @@ Duplicate: ${possibleDuplicate}
 
         <p>This link expires in 1 hour</p>
       `
-    }).then(() => {
-      console.log("Email sent to:", approver);
+    }).then((emailResult) => {
+      console.log("Email sent via Resend:", emailResult);
     }).catch((emailErr) => {
-      console.error("Email failed (non-blocking):", emailErr.message);
+      console.error("Resend email failed:", emailErr);
     });
 
   } catch (error) {
