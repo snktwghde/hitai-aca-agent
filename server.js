@@ -67,6 +67,20 @@ function getAmountBucket(amount) {
 }
 
 // ===============================
+// HELPER: BUCKET TO AMOUNT RANGE (for rule suggestions)
+// ===============================
+function bucketToAmountRange(bucket) {
+  const ranges = {
+    "under_10k": { max_amount: 10000 },
+    "10k_50k": { min_amount: 10000, max_amount: 50000 },
+    "50k_100k": { min_amount: 50000, max_amount: 100000 },
+    "100k_500k": { min_amount: 100000, max_amount: 500000 },
+    "over_500k": { min_amount: 500000 }
+  };
+  return ranges[bucket] || {};
+}
+
+// ===============================
 // INTELLIGENCE: GET OR CREATE VENDOR SCORE
 // ===============================
 async function getOrCreateVendorScore(tenantId, vendorName) {
@@ -244,7 +258,6 @@ async function recordPrediction(tenantId, invoiceId, invoiceDbId, predictedActio
 // INTELLIGENCE: CLOSE PREDICTION (on human approval/rejection)
 // ===============================
 async function closePrediction(tenantId, invoiceId, actualOutcome) {
-  // Find the prediction for this invoice and fill in the outcome
   const pred = await pool.query(
     `SELECT id, predicted_action FROM prediction_confidence
      WHERE tenant_id = $1 AND invoice_id = $2 AND actual_outcome IS NULL
@@ -255,13 +268,11 @@ async function closePrediction(tenantId, invoiceId, actualOutcome) {
   if (pred.rows.length === 0) return;
 
   const prediction = pred.rows[0];
-  // "approve" prediction is correct if actual is "approved", etc.
   const wasCorrect = (
     (prediction.predicted_action === "approve" && actualOutcome === "approved") ||
     (prediction.predicted_action === "reject" && actualOutcome === "rejected") ||
     (prediction.predicted_action === "review" && (actualOutcome === "approved" || actualOutcome === "rejected"))
   );
-  // For "review" predictions, we consider it correct either way since the intent was to get human input
 
   await pool.query(
     `UPDATE prediction_confidence
@@ -290,7 +301,6 @@ async function updateApprovalPattern(tenantId, approverEmail, vendorName, amount
   );
 
   // Recalculate confidence for this approver+vendor+bucket combo
-  // confidence = this_decision_count / total_decisions_for_combo
   const totals = await pool.query(
     `SELECT decision, occurrence_count
      FROM approval_patterns
@@ -309,6 +319,86 @@ async function updateApprovalPattern(tenantId, approverEmail, vendorName, amount
       [conf, tenantId, approverEmail, vendorName, bucket, row.decision]
     );
   }
+}
+
+// ===============================
+// INTELLIGENCE: GENERATE RULE SUGGESTIONS
+// ===============================
+async function generateRuleSuggestions(tenantId) {
+  // Find patterns where: decision=approved, occurrence_count >= 3, confidence >= 0.85
+  const patterns = await pool.query(
+    `SELECT ap.approver_email, ap.vendor_name, ap.amount_bucket, ap.occurrence_count, ap.confidence
+     FROM approval_patterns ap
+     WHERE ap.tenant_id = $1
+       AND ap.decision = 'approved'
+       AND ap.occurrence_count >= 3
+       AND ap.confidence >= 0.85
+     ORDER BY ap.occurrence_count DESC`,
+    [tenantId]
+  );
+
+  if (patterns.rows.length === 0) return [];
+
+  // Load existing rules to avoid suggesting duplicates
+  const existingRules = await pool.query(
+    `SELECT conditions FROM tenant_rules
+     WHERE tenant_id = $1 AND is_active = TRUE AND action = 'approve'`,
+    [tenantId]
+  );
+
+  const suggestions = [];
+
+  for (const pattern of patterns.rows) {
+    // Check if a rule already covers this vendor
+    const alreadyCovered = existingRules.rows.some(rule => {
+      const c = rule.conditions;
+      if (c.vendor && c.vendor.toLowerCase() === pattern.vendor_name.toLowerCase()) return true;
+      return false;
+    });
+
+    if (alreadyCovered) continue;
+
+    // Get the vendor's current reliability score
+    const vendorScore = await pool.query(
+      `SELECT reliability_score FROM vendor_scores
+       WHERE tenant_id = $1 AND vendor_name = $2`,
+      [tenantId, pattern.vendor_name]
+    );
+
+    const reliability = vendorScore.rows.length > 0
+      ? parseFloat(vendorScore.rows[0].reliability_score)
+      : 0;
+
+    // Only suggest if vendor also has good reliability
+    if (reliability < 60) continue;
+
+    const amountRange = bucketToAmountRange(pattern.amount_bucket);
+
+    suggestions.push({
+      type: "auto_approve",
+      reason: `${pattern.approver_email} has approved ${pattern.occurrence_count} invoices from ${pattern.vendor_name} in the ${pattern.amount_bucket} range with ${(pattern.confidence * 100).toFixed(0)}% consistency. Vendor reliability: ${reliability}/100.`,
+      suggested_rule: {
+        rule_name: `Auto-approve ${pattern.vendor_name} (${pattern.amount_bucket})`,
+        rule_type: "auto_approve",
+        conditions: {
+          vendor: pattern.vendor_name,
+          ...amountRange,
+          is_known_vendor: true,
+          vendor_score_min: 60
+        },
+        action: "approve",
+        priority: 50
+      },
+      evidence: {
+        approver: pattern.approver_email,
+        occurrences: pattern.occurrence_count,
+        pattern_confidence: parseFloat(pattern.confidence),
+        vendor_reliability: reliability
+      }
+    });
+  }
+
+  return suggestions;
 }
 
 // ===============================
@@ -486,10 +576,8 @@ Possible duplicate: ${possibleDuplicate}
       hardRuleFired = true;
     }
 
-    if (hardRuleFired && decisionSource === "rules_engine") {
-      decisionSource = "hard_rule"; // hard rule overrode the rules engine
-    } else if (hardRuleFired) {
-      decisionSource = "hard_rule"; // hard rule overrode the LLM
+    if (hardRuleFired) {
+      decisionSource = "hard_rule";
     }
 
     console.log("Final Decision:", result.action, `(source: ${decisionSource})`);
@@ -769,6 +857,227 @@ app.get("/reject", async (req, res) => {
   } catch (error) {
     console.error("Reject Error:", error);
     res.status(500).send("Something went wrong. Please try again.");
+  }
+});
+
+// ===============================
+// INTELLIGENCE DASHBOARD ENDPOINT
+// ===============================
+app.get("/intelligence", async (req, res) => {
+
+  const tenantId = req.query.tenant_id;
+
+  try {
+    const tenant = await validateTenant(tenantId);
+    if (!tenant) {
+      return res.status(400).json({ error: "Missing or invalid tenant_id" });
+    }
+
+    // --- SYSTEM STATS ---
+    const statsResult = await pool.query(
+      `SELECT
+         COUNT(*) as total_invoices,
+         COUNT(*) FILTER (WHERE approval_status = 'approved') as total_approved,
+         COUNT(*) FILTER (WHERE approval_status = 'rejected') as total_rejected,
+         COUNT(*) FILTER (WHERE approval_status = 'pending') as total_pending,
+         COALESCE(SUM(amount), 0) as total_amount,
+         COALESCE(SUM(amount) FILTER (WHERE approval_status = 'pending'), 0) as pending_amount
+       FROM invoices WHERE tenant_id = $1`,
+      [tenantId]
+    );
+
+    const stats = statsResult.rows[0];
+
+    // --- DECISION SOURCE BREAKDOWN ---
+    const sourceBreakdown = await pool.query(
+      `SELECT
+         decision_source,
+         COUNT(*) as count
+       FROM prediction_confidence
+       WHERE tenant_id = $1
+       GROUP BY decision_source`,
+      [tenantId]
+    );
+
+    const decisionSources = {};
+    let totalDecisions = 0;
+    for (const row of sourceBreakdown.rows) {
+      decisionSources[row.decision_source] = parseInt(row.count);
+      totalDecisions += parseInt(row.count);
+    }
+
+    const autoDecisionRate = totalDecisions > 0
+      ? ((decisionSources.rules_engine || 0) + (decisionSources.hard_rule || 0)) / totalDecisions
+      : 0;
+
+    // --- PREDICTION ACCURACY ---
+    const accuracyResult = await pool.query(
+      `SELECT
+         COUNT(*) as total_closed,
+         COUNT(*) FILTER (WHERE was_correct = TRUE) as correct,
+         COUNT(*) FILTER (WHERE was_correct = FALSE) as incorrect
+       FROM prediction_confidence
+       WHERE tenant_id = $1 AND actual_outcome IS NOT NULL`,
+      [tenantId]
+    );
+
+    const accuracy = accuracyResult.rows[0];
+    const predictionAccuracy = parseInt(accuracy.total_closed) > 0
+      ? parseInt(accuracy.correct) / parseInt(accuracy.total_closed)
+      : null;
+
+    // --- VENDOR SCORES (top 20 by invoice count) ---
+    const vendorScores = await pool.query(
+      `SELECT vendor_name, reliability_score, total_invoices, total_approved,
+              total_rejected, total_paid, avg_amount, dispute_rate, last_updated
+       FROM vendor_scores
+       WHERE tenant_id = $1
+       ORDER BY total_invoices DESC
+       LIMIT 20`,
+      [tenantId]
+    );
+
+    // --- APPROVAL PATTERNS (top 20 by occurrence) ---
+    const approvalPatterns = await pool.query(
+      `SELECT approver_email, vendor_name, amount_bucket, decision,
+              occurrence_count, confidence, last_observed
+       FROM approval_patterns
+       WHERE tenant_id = $1
+       ORDER BY occurrence_count DESC
+       LIMIT 20`,
+      [tenantId]
+    );
+
+    // --- RULE SUGGESTIONS ---
+    const suggestions = await generateRuleSuggestions(tenantId);
+
+    // --- ACTIVE RULES ---
+    const activeRules = await pool.query(
+      `SELECT id, rule_name, rule_type, conditions, action, priority
+       FROM tenant_rules
+       WHERE tenant_id = $1 AND is_active = TRUE
+       ORDER BY priority ASC`,
+      [tenantId]
+    );
+
+    // --- RECENT PREDICTIONS (last 10) ---
+    const recentPredictions = await pool.query(
+      `SELECT invoice_id, predicted_action, confidence_score, decision_source,
+              actual_outcome, was_correct, created_at
+       FROM prediction_confidence
+       WHERE tenant_id = $1
+       ORDER BY created_at DESC
+       LIMIT 10`,
+      [tenantId]
+    );
+
+    res.json({
+      tenant: tenant.name,
+      system_stats: {
+        total_invoices: parseInt(stats.total_invoices),
+        total_approved: parseInt(stats.total_approved),
+        total_rejected: parseInt(stats.total_rejected),
+        total_pending: parseInt(stats.total_pending),
+        total_amount: parseFloat(stats.total_amount),
+        pending_amount: parseFloat(stats.pending_amount)
+      },
+      decision_engine: {
+        total_decisions: totalDecisions,
+        by_source: decisionSources,
+        auto_decision_rate: parseFloat(autoDecisionRate.toFixed(4)),
+        llm_calls_saved: (decisionSources.rules_engine || 0) + (decisionSources.hard_rule || 0)
+      },
+      prediction_accuracy: {
+        total_closed: parseInt(accuracy.total_closed),
+        correct: parseInt(accuracy.correct),
+        incorrect: parseInt(accuracy.incorrect),
+        accuracy: predictionAccuracy !== null ? parseFloat(predictionAccuracy.toFixed(4)) : null
+      },
+      vendor_intelligence: vendorScores.rows.map(v => ({
+        vendor_name: v.vendor_name,
+        reliability_score: parseFloat(v.reliability_score),
+        total_invoices: v.total_invoices,
+        total_approved: v.total_approved,
+        total_rejected: v.total_rejected,
+        avg_amount: v.avg_amount ? parseFloat(v.avg_amount) : null,
+        dispute_rate: parseFloat(v.dispute_rate),
+        last_updated: v.last_updated
+      })),
+      approval_patterns: approvalPatterns.rows.map(p => ({
+        approver: p.approver_email,
+        vendor: p.vendor_name,
+        amount_bucket: p.amount_bucket,
+        decision: p.decision,
+        occurrences: p.occurrence_count,
+        confidence: parseFloat(p.confidence),
+        last_observed: p.last_observed
+      })),
+      suggested_rules: suggestions,
+      active_rules: activeRules.rows.map(r => ({
+        id: r.id,
+        name: r.rule_name,
+        type: r.rule_type,
+        conditions: r.conditions,
+        action: r.action,
+        priority: r.priority
+      })),
+      recent_predictions: recentPredictions.rows.map(p => ({
+        invoice_id: p.invoice_id,
+        predicted: p.predicted_action,
+        confidence: parseFloat(p.confidence_score),
+        source: p.decision_source,
+        actual_outcome: p.actual_outcome,
+        was_correct: p.was_correct,
+        timestamp: p.created_at
+      }))
+    });
+
+  } catch (error) {
+    console.error("Intelligence Error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ===============================
+// RULES LIST ENDPOINT
+// ===============================
+app.get("/rules", async (req, res) => {
+
+  const tenantId = req.query.tenant_id;
+
+  try {
+    const tenant = await validateTenant(tenantId);
+    if (!tenant) {
+      return res.status(400).json({ error: "Missing or invalid tenant_id" });
+    }
+
+    const rules = await pool.query(
+      `SELECT id, rule_name, rule_type, conditions, action, priority, is_active, created_at, updated_at
+       FROM tenant_rules
+       WHERE tenant_id = $1
+       ORDER BY priority ASC`,
+      [tenantId]
+    );
+
+    res.json({
+      tenant: tenant.name,
+      total_rules: rules.rows.length,
+      rules: rules.rows.map(r => ({
+        id: r.id,
+        name: r.rule_name,
+        type: r.rule_type,
+        conditions: r.conditions,
+        action: r.action,
+        priority: r.priority,
+        is_active: r.is_active,
+        created_at: r.created_at,
+        updated_at: r.updated_at
+      }))
+    });
+
+  } catch (error) {
+    console.error("Rules Error:", error);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
