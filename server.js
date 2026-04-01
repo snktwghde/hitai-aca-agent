@@ -38,9 +38,9 @@ const pool = new Pool({
 // -------------------------------
 const resend = new Resend(process.env.RESEND_API_KEY);
 
-// -------------------------------
-// TENANT VALIDATION HELPER
-// -------------------------------
+// ===============================
+// HELPER: TENANT VALIDATION
+// ===============================
 async function validateTenant(tenantId) {
   if (!tenantId) return null;
 
@@ -55,9 +55,265 @@ async function validateTenant(tenantId) {
   return result.rows.length > 0 ? result.rows[0] : null;
 }
 
-// -------------------------------
-// MAIN API
-// -------------------------------
+// ===============================
+// HELPER: AMOUNT BUCKET
+// ===============================
+function getAmountBucket(amount) {
+  if (amount < 10000) return "under_10k";
+  if (amount < 50000) return "10k_50k";
+  if (amount < 100000) return "50k_100k";
+  if (amount < 500000) return "100k_500k";
+  return "over_500k";
+}
+
+// ===============================
+// INTELLIGENCE: GET OR CREATE VENDOR SCORE
+// ===============================
+async function getOrCreateVendorScore(tenantId, vendorName) {
+  const existing = await pool.query(
+    `SELECT * FROM vendor_scores WHERE tenant_id = $1 AND vendor_name = $2`,
+    [tenantId, vendorName]
+  );
+
+  if (existing.rows.length > 0) {
+    return existing.rows[0];
+  }
+
+  // New vendor — insert with defaults (reliability 50, no history)
+  const inserted = await pool.query(
+    `INSERT INTO vendor_scores (tenant_id, vendor_name)
+     VALUES ($1, $2)
+     RETURNING *`,
+    [tenantId, vendorName]
+  );
+
+  return inserted.rows[0];
+}
+
+// ===============================
+// INTELLIGENCE: UPDATE VENDOR SCORE AFTER INVOICE
+// ===============================
+async function updateVendorScoreOnInvoice(tenantId, vendorName, amount) {
+  // Recalculate from actual invoice data for accuracy
+  const stats = await pool.query(
+    `SELECT COUNT(*) as total, AVG(amount) as avg_amt
+     FROM invoices WHERE vendor = $1 AND tenant_id = $2`,
+    [vendorName, tenantId]
+  );
+
+  const total = parseInt(stats.rows[0].total) || 0;
+  const avgAmt = parseFloat(stats.rows[0].avg_amt) || amount;
+
+  await pool.query(
+    `UPDATE vendor_scores
+     SET total_invoices = $3,
+         avg_amount = $4,
+         last_updated = NOW()
+     WHERE tenant_id = $1 AND vendor_name = $2`,
+    [tenantId, vendorName, total, avgAmt]
+  );
+}
+
+// ===============================
+// INTELLIGENCE: UPDATE VENDOR SCORE ON APPROVAL/REJECTION
+// ===============================
+async function updateVendorScoreOnApproval(tenantId, vendorName, decision) {
+  // Recalculate approved/rejected counts from actual data
+  const counts = await pool.query(
+    `SELECT
+       COUNT(*) FILTER (WHERE approval_status = 'approved') as approved,
+       COUNT(*) FILTER (WHERE approval_status = 'rejected') as rejected
+     FROM invoices WHERE vendor = $1 AND tenant_id = $2`,
+    [vendorName, tenantId]
+  );
+
+  const approved = parseInt(counts.rows[0].approved) || 0;
+  const rejected = parseInt(counts.rows[0].rejected) || 0;
+  const total = approved + rejected;
+
+  // Reliability score: percentage of approved invoices, scaled 0-100
+  // Weighted: starts moving meaningfully after 3+ decisions
+  let reliability = 50; // default
+  if (total >= 1) {
+    const rawRatio = approved / total; // 0 to 1
+    // Blend toward 50 for small sample sizes (Bayesian-ish smoothing)
+    const weight = Math.min(total / 5, 1); // full weight at 5+ decisions
+    reliability = Math.round((rawRatio * weight + 0.5 * (1 - weight)) * 100);
+  }
+
+  // Dispute rate: rejected / total
+  const disputeRate = total > 0 ? (rejected / total) : 0;
+
+  await pool.query(
+    `UPDATE vendor_scores
+     SET total_approved = $3,
+         total_rejected = $4,
+         reliability_score = $5,
+         dispute_rate = $6,
+         last_updated = NOW()
+     WHERE tenant_id = $1 AND vendor_name = $2`,
+    [tenantId, vendorName, approved, rejected, reliability, disputeRate]
+  );
+}
+
+// ===============================
+// INTELLIGENCE: RULES ENGINE
+// ===============================
+async function evaluateRules(tenantId, invoice, vendorScore, possibleDuplicate) {
+  // Load active rules for this tenant, ordered by priority (lowest first = highest priority)
+  const rulesResult = await pool.query(
+    `SELECT * FROM tenant_rules
+     WHERE tenant_id = $1 AND is_active = TRUE
+     ORDER BY priority ASC`,
+    [tenantId]
+  );
+
+  const rules = rulesResult.rows;
+  if (rules.length === 0) return null;
+
+  const amount = parseFloat(invoice.amount);
+
+  for (const rule of rules) {
+    const c = rule.conditions;
+    let match = true;
+
+    // Check each condition — ALL must be true for the rule to fire
+
+    // Vendor exact match
+    if (c.vendor && c.vendor.toLowerCase() !== invoice.vendor.toLowerCase()) {
+      match = false;
+    }
+
+    // Amount range
+    if (c.min_amount !== undefined && amount < c.min_amount) {
+      match = false;
+    }
+    if (c.max_amount !== undefined && amount > c.max_amount) {
+      match = false;
+    }
+
+    // Department match
+    if (c.department && c.department.toLowerCase() !== (invoice.department || "").toLowerCase()) {
+      match = false;
+    }
+
+    // Vendor must be known (exists in vendor_scores with history)
+    if (c.is_known_vendor === true && (!vendorScore || vendorScore.total_invoices === 0)) {
+      match = false;
+    }
+
+    // Vendor reliability score minimum
+    if (c.vendor_score_min !== undefined) {
+      if (!vendorScore || parseFloat(vendorScore.reliability_score) < c.vendor_score_min) {
+        match = false;
+      }
+    }
+
+    // Duplicate flag
+    if (c.is_duplicate === true && !possibleDuplicate) {
+      match = false;
+    }
+
+    if (match) {
+      console.log(`Rule matched: "${rule.rule_name}" (priority ${rule.priority}) → ${rule.action}`);
+      return {
+        action: rule.action,
+        reasoning: `Deterministic rule: ${rule.rule_name}`,
+        ruleId: rule.id,
+        ruleName: rule.rule_name
+      };
+    }
+  }
+
+  return null; // No rule matched — proceed to LLM
+}
+
+// ===============================
+// INTELLIGENCE: RECORD PREDICTION
+// ===============================
+async function recordPrediction(tenantId, invoiceId, invoiceDbId, predictedAction, confidenceScore, source, ruleId) {
+  await pool.query(
+    `INSERT INTO prediction_confidence
+     (tenant_id, invoice_id, invoice_db_id, predicted_action, confidence_score, decision_source, rule_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [tenantId, invoiceId, invoiceDbId, predictedAction, confidenceScore, source, ruleId || null]
+  );
+}
+
+// ===============================
+// INTELLIGENCE: CLOSE PREDICTION (on human approval/rejection)
+// ===============================
+async function closePrediction(tenantId, invoiceId, actualOutcome) {
+  // Find the prediction for this invoice and fill in the outcome
+  const pred = await pool.query(
+    `SELECT id, predicted_action FROM prediction_confidence
+     WHERE tenant_id = $1 AND invoice_id = $2 AND actual_outcome IS NULL
+     ORDER BY created_at DESC LIMIT 1`,
+    [tenantId, invoiceId]
+  );
+
+  if (pred.rows.length === 0) return;
+
+  const prediction = pred.rows[0];
+  // "approve" prediction is correct if actual is "approved", etc.
+  const wasCorrect = (
+    (prediction.predicted_action === "approve" && actualOutcome === "approved") ||
+    (prediction.predicted_action === "reject" && actualOutcome === "rejected") ||
+    (prediction.predicted_action === "review" && (actualOutcome === "approved" || actualOutcome === "rejected"))
+  );
+  // For "review" predictions, we consider it correct either way since the intent was to get human input
+
+  await pool.query(
+    `UPDATE prediction_confidence
+     SET actual_outcome = $1, was_correct = $2, feedback_timestamp = NOW()
+     WHERE id = $3`,
+    [actualOutcome, wasCorrect, prediction.id]
+  );
+}
+
+// ===============================
+// INTELLIGENCE: UPDATE APPROVAL PATTERN
+// ===============================
+async function updateApprovalPattern(tenantId, approverEmail, vendorName, amount, decision) {
+  const bucket = getAmountBucket(amount);
+
+  // Upsert: increment count if pattern exists, insert if new
+  await pool.query(
+    `INSERT INTO approval_patterns
+     (tenant_id, approver_email, vendor_name, amount_bucket, decision, occurrence_count, last_observed)
+     VALUES ($1, $2, $3, $4, $5, 1, NOW())
+     ON CONFLICT (tenant_id, approver_email, vendor_name, amount_bucket, decision)
+     DO UPDATE SET
+       occurrence_count = approval_patterns.occurrence_count + 1,
+       last_observed = NOW()`,
+    [tenantId, approverEmail, vendorName, bucket, decision]
+  );
+
+  // Recalculate confidence for this approver+vendor+bucket combo
+  // confidence = this_decision_count / total_decisions_for_combo
+  const totals = await pool.query(
+    `SELECT decision, occurrence_count
+     FROM approval_patterns
+     WHERE tenant_id = $1 AND approver_email = $2 AND vendor_name = $3 AND amount_bucket = $4`,
+    [tenantId, approverEmail, vendorName, bucket]
+  );
+
+  const totalCount = totals.rows.reduce((sum, r) => sum + r.occurrence_count, 0);
+
+  for (const row of totals.rows) {
+    const conf = totalCount > 0 ? row.occurrence_count / totalCount : 0.5;
+    await pool.query(
+      `UPDATE approval_patterns SET confidence = $1
+       WHERE tenant_id = $2 AND approver_email = $3 AND vendor_name = $4
+       AND amount_bucket = $5 AND decision = $6`,
+      [conf, tenantId, approverEmail, vendorName, bucket, row.decision]
+    );
+  }
+}
+
+// ===============================
+// MAIN API: ANALYZE INVOICE
+// ===============================
 app.post("/analyze-invoice", async (req, res) => {
 
   const invoice = req.body;
@@ -65,7 +321,7 @@ app.post("/analyze-invoice", async (req, res) => {
   try {
 
     // -------------------------------
-    // INPUT VALIDATION [FIX #5]
+    // INPUT VALIDATION
     // -------------------------------
     if (!invoice.vendor || !invoice.amount || !invoice.date) {
       return res.status(400).json({ error: "Missing required fields: vendor, amount, date" });
@@ -89,7 +345,12 @@ app.post("/analyze-invoice", async (req, res) => {
     console.log("Incoming Invoice:", invoice.invoice_id, invoice.vendor, amount);
 
     // -------------------------------
-    // Vendor History (tenant-scoped)
+    // VENDOR INTELLIGENCE: Load or create vendor score
+    // -------------------------------
+    const vendorScore = await getOrCreateVendorScore(tenantId, invoice.vendor);
+
+    // -------------------------------
+    // Vendor History (tenant-scoped) — for LLM context + hard rules
     // -------------------------------
     const vendorHistory = await pool.query(
       `SELECT AVG(amount) as avg_amount
@@ -100,7 +361,7 @@ app.post("/analyze-invoice", async (req, res) => {
     const avgAmount = parseFloat(vendorHistory.rows[0].avg_amount) || 0;
 
     // -------------------------------
-    // Duplicate Check (tenant-scoped) [FIX #4]
+    // Duplicate Check (tenant-scoped)
     // -------------------------------
     const duplicateCheck = await pool.query(
       `SELECT 1 FROM invoices
@@ -112,24 +373,51 @@ app.post("/analyze-invoice", async (req, res) => {
 
     const possibleDuplicate = duplicateCheck.rows.length > 0;
 
-    // -------------------------------
-    // OpenAI Decision [FIX #6 — only send what LLM needs]
-    // -------------------------------
-    const llmPayload = {
-      invoice_id: invoice.invoice_id,
-      vendor: invoice.vendor,
-      amount: amount,
-      department: invoice.department,
-      date: invoice.date
-    };
+    // ===============================
+    // RULES ENGINE: Evaluate BEFORE LLM
+    // ===============================
+    let result;
+    let decisionSource = "llm"; // default
+    let matchedRuleId = null;
 
-    const response = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        {
-          role: "system",
-          content: `
-You are a financial controller.
+    const ruleResult = await evaluateRules(tenantId, invoice, vendorScore, possibleDuplicate);
+
+    if (ruleResult) {
+      // Rule matched — skip LLM entirely
+      result = {
+        confidence: ruleResult.action === "approve" ? 0.95 : ruleResult.action === "reject" ? 0.99 : 0.7,
+        action: ruleResult.action,
+        reasoning: ruleResult.reasoning
+      };
+      decisionSource = "rules_engine";
+      matchedRuleId = ruleResult.ruleId;
+
+      console.log(`Rules engine decided: ${result.action} (skipped LLM)`);
+    } else {
+      // No rule matched — call OpenAI
+      console.log("No rule matched — calling LLM");
+
+      // Build LLM payload (no tenant_id sent to third party)
+      const llmPayload = {
+        invoice_id: invoice.invoice_id,
+        vendor: invoice.vendor,
+        amount: amount,
+        department: invoice.department,
+        date: invoice.date
+      };
+
+      // Enrich AI prompt with intelligence context
+      const vendorContext = vendorScore.total_invoices > 0
+        ? `Vendor "${invoice.vendor}" profile: reliability ${vendorScore.reliability_score}/100, ${vendorScore.total_invoices} past invoices, avg amount ${vendorScore.avg_amount || "unknown"}, dispute rate ${(vendorScore.dispute_rate * 100).toFixed(1)}%.`
+        : `Vendor "${invoice.vendor}" is new — no prior history.`;
+
+      const response = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "system",
+            content: `
+You are a financial controller for ${tenant.name}.
 
 Return ONLY valid JSON.
 
@@ -140,44 +428,38 @@ Format:
   "reasoning": "string"
 }
 
-Vendor avg: ${avgAmount}
-Duplicate: ${possibleDuplicate}
+Context:
+${vendorContext}
+Vendor avg invoice: ${avgAmount || "no history"}
+Possible duplicate: ${possibleDuplicate}
 `
-        },
-        {
-          role: "user",
-          content: JSON.stringify(llmPayload)
-        }
-      ],
-      temperature: 0
-    });
+          },
+          {
+            role: "user",
+            content: JSON.stringify(llmPayload)
+          }
+        ],
+        temperature: 0
+      });
 
-    // -------------------------------
-    // SAFE PARSING
-    // -------------------------------
-    let resultText = response.choices[0].message.content.trim();
+      // Safe parsing
+      let resultText = response.choices[0].message.content.trim();
+      resultText = resultText.replace(/```json/g, "").replace(/```/g, "").trim();
 
-    resultText = resultText
-      .replace(/```json/g, "")
-      .replace(/```/g, "")
-      .trim();
-
-    let result;
-
-    try {
-      result = JSON.parse(resultText);
-    } catch {
-      console.log("⚠️ JSON parse failed → fallback");
-
-      result = {
-        confidence: 0.6,
-        action: "review",
-        reasoning: resultText
-      };
+      try {
+        result = JSON.parse(resultText);
+      } catch {
+        console.log("⚠️ JSON parse failed → fallback");
+        result = {
+          confidence: 0.6,
+          action: "review",
+          reasoning: resultText
+        };
+      }
     }
 
     // -------------------------------
-    // CONFIDENCE FIX
+    // CONFIDENCE NORMALIZATION
     // -------------------------------
     const confidenceScore = typeof result.confidence === "number" ? result.confidence : 0.6;
 
@@ -186,23 +468,34 @@ Duplicate: ${possibleDuplicate}
       confidenceScore >= 0.5 ? "medium" : "low";
 
     // -------------------------------
-    // HARD RULES [FIX #10 — duplicate wins over amount]
+    // HARD RULES — override both rules engine and LLM
+    // These are safety-critical and always run
     // -------------------------------
+    let hardRuleFired = false;
+
     if (avgAmount > 0 && amount > 3 * avgAmount) {
       result.action = "review";
-      result.reasoning = "Amount exceeds vendor average";
+      result.reasoning = "Amount exceeds 3x vendor average";
+      hardRuleFired = true;
     }
 
     // Duplicate check runs LAST so it always wins
     if (possibleDuplicate) {
       result.action = "reject";
       result.reasoning = "Duplicate invoice detected";
+      hardRuleFired = true;
     }
 
-    console.log("Final Decision:", result);
+    if (hardRuleFired && decisionSource === "rules_engine") {
+      decisionSource = "hard_rule"; // hard rule overrode the rules engine
+    } else if (hardRuleFired) {
+      decisionSource = "hard_rule"; // hard rule overrode the LLM
+    }
+
+    console.log("Final Decision:", result.action, `(source: ${decisionSource})`);
 
     // -------------------------------
-    // TOKEN GENERATION 🔐
+    // TOKEN GENERATION
     // -------------------------------
     const token = crypto.randomBytes(32).toString("hex");
 
@@ -214,13 +507,14 @@ Duplicate: ${possibleDuplicate}
     // -------------------------------
     // SAVE INVOICE (tenant-scoped)
     // -------------------------------
-    await pool.query(
+    const insertResult = await pool.query(
       `INSERT INTO invoices
       (invoice_id, vendor, amount, department, invoice_date,
        decision, confidence, confidence_score, reasoning,
        approval_status, approval_token, token_expiry, approved_by,
        tenant_id)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, NOW() + interval '1 hour', $12, $13)`,
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, NOW() + interval '1 hour', $12, $13)
+      RETURNING id`,
       [
         invoice.invoice_id,
         invoice.vendor,
@@ -238,6 +532,26 @@ Duplicate: ${possibleDuplicate}
       ]
     );
 
+    const invoiceDbId = insertResult.rows[0].id;
+
+    // -------------------------------
+    // INTELLIGENCE: Record prediction
+    // -------------------------------
+    await recordPrediction(
+      tenantId,
+      invoice.invoice_id,
+      invoiceDbId,
+      result.action,
+      confidenceScore,
+      decisionSource,
+      matchedRuleId
+    );
+
+    // -------------------------------
+    // INTELLIGENCE: Update vendor score (invoice count + avg)
+    // -------------------------------
+    await updateVendorScoreOnInvoice(tenantId, invoice.vendor, amount);
+
     // -------------------------------
     // AUDIT LOG (tenant-scoped)
     // -------------------------------
@@ -251,7 +565,9 @@ Duplicate: ${possibleDuplicate}
           vendor: invoice.vendor,
           amount: amount,
           decision: result.action,
-          confidence: confidenceLevel
+          confidence: confidenceLevel,
+          decision_source: decisionSource,
+          rule_name: decisionSource === "rules_engine" ? result.reasoning : null
         }),
         tenantId
       ]
@@ -264,11 +580,12 @@ Duplicate: ${possibleDuplicate}
       message: "Invoice processed",
       tenant: tenant.name,
       decision: result.action,
-      confidence: confidenceLevel
+      confidence: confidenceLevel,
+      decision_source: decisionSource
     });
 
     // -------------------------------
-    // EMAIL (fire-and-forget via Resend) [FIX #1 — use APP_URL]
+    // EMAIL (fire-and-forget via Resend)
     // -------------------------------
     const baseUrl = process.env.APP_URL || "http://localhost:3000";
     const approveUrl = `${baseUrl}/approve?token=${token}`;
@@ -284,6 +601,7 @@ Duplicate: ${possibleDuplicate}
         <p><b>Vendor:</b> ${invoice.vendor}</p>
         <p><b>Amount:</b> ${amount}</p>
         <p><b>AI Decision:</b> ${result.action}</p>
+        <p><b>Source:</b> ${decisionSource === "rules_engine" ? "Auto-rule" : decisionSource === "hard_rule" ? "Safety rule" : "AI analysis"}</p>
 
         <a href="${approveUrl}">Approve</a><br/><br/>
         <a href="${rejectUrl}">Reject</a>
@@ -302,9 +620,9 @@ Duplicate: ${possibleDuplicate}
   }
 });
 
-// -------------------------------
-// APPROVE (SECURE) [FIX #2 — try/catch, FIX #3 — invalidate token]
-// -------------------------------
+// ===============================
+// APPROVE (SECURE)
+// ===============================
 app.get("/approve", async (req, res) => {
 
   const { token } = req.query;
@@ -316,7 +634,7 @@ app.get("/approve", async (req, res) => {
   try {
 
     const result = await pool.query(
-      `SELECT * FROM invoices 
+      `SELECT * FROM invoices
        WHERE approval_token=$1
        AND token_expiry > NOW()
        AND approval_status='pending'`,
@@ -339,6 +657,22 @@ app.get("/approve", async (req, res) => {
       [token]
     );
 
+    // INTELLIGENCE: Close prediction with actual outcome
+    await closePrediction(invoice.tenant_id, invoice.invoice_id, "approved");
+
+    // INTELLIGENCE: Update vendor score based on approval
+    await updateVendorScoreOnApproval(invoice.tenant_id, invoice.vendor, "approved");
+
+    // INTELLIGENCE: Record approval pattern
+    await updateApprovalPattern(
+      invoice.tenant_id,
+      invoice.approved_by,
+      invoice.vendor,
+      parseFloat(invoice.amount),
+      "approved"
+    );
+
+    // AUDIT LOG
     await pool.query(
       `INSERT INTO audit_log (event, metadata, tenant_id)
        VALUES ($1, $2, $3)`,
@@ -346,7 +680,9 @@ app.get("/approve", async (req, res) => {
         "invoice_approved",
         JSON.stringify({
           invoice_id: invoice.invoice_id,
-          approved_by: invoice.approved_by
+          approved_by: invoice.approved_by,
+          vendor: invoice.vendor,
+          amount: parseFloat(invoice.amount)
         }),
         invoice.tenant_id
       ]
@@ -360,9 +696,9 @@ app.get("/approve", async (req, res) => {
   }
 });
 
-// -------------------------------
-// REJECT (SECURE) [FIX #2 — try/catch, FIX #3 — invalidate token]
-// -------------------------------
+// ===============================
+// REJECT (SECURE)
+// ===============================
 app.get("/reject", async (req, res) => {
 
   const { token } = req.query;
@@ -374,7 +710,7 @@ app.get("/reject", async (req, res) => {
   try {
 
     const result = await pool.query(
-      `SELECT * FROM invoices 
+      `SELECT * FROM invoices
        WHERE approval_token=$1
        AND token_expiry > NOW()
        AND approval_status='pending'`,
@@ -397,6 +733,22 @@ app.get("/reject", async (req, res) => {
       [token]
     );
 
+    // INTELLIGENCE: Close prediction with actual outcome
+    await closePrediction(invoice.tenant_id, invoice.invoice_id, "rejected");
+
+    // INTELLIGENCE: Update vendor score based on rejection
+    await updateVendorScoreOnApproval(invoice.tenant_id, invoice.vendor, "rejected");
+
+    // INTELLIGENCE: Record rejection pattern
+    await updateApprovalPattern(
+      invoice.tenant_id,
+      invoice.approved_by,
+      invoice.vendor,
+      parseFloat(invoice.amount),
+      "rejected"
+    );
+
+    // AUDIT LOG
     await pool.query(
       `INSERT INTO audit_log (event, metadata, tenant_id)
        VALUES ($1, $2, $3)`,
@@ -404,7 +756,9 @@ app.get("/reject", async (req, res) => {
         "invoice_rejected",
         JSON.stringify({
           invoice_id: invoice.invoice_id,
-          rejected_by: invoice.approved_by
+          rejected_by: invoice.approved_by,
+          vendor: invoice.vendor,
+          amount: parseFloat(invoice.amount)
         }),
         invoice.tenant_id
       ]
@@ -420,12 +774,12 @@ app.get("/reject", async (req, res) => {
 
 // -------------------------------
 app.get("/", (req, res) => {
-  res.send("Secure ACA Agent Running");
+  res.send("Secure ACA Agent Running — Intelligence Layer Active");
 });
 
 // -------------------------------
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-  console.log(`Secure ACA running on port ${PORT}`);
+  console.log(`Secure ACA running on port ${PORT} — Rules engine + Intelligence layer active`);
 });
