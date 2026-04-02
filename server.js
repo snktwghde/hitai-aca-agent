@@ -680,7 +680,7 @@ Possible duplicate: ${possibleDuplicate}
     const rejectUrl = `${baseUrl}/reject?token=${token}`;
 
     resend.emails.send({
-      from: "Embed ACA <onboarding@resend.dev>",
+      from: "Embed ACA <noreply@mail.embedlab.co>",
       to: [approver],
       subject: `Invoice Approval — ${tenant.name}`,
       html: `
