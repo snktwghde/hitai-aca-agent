@@ -1,4 +1,6 @@
 OPENAI_API_KEY=
 DB_URL=
+RESEND_API_KEY=
 EMAIL_USER=
-EMAIL_PASS=
+APP_URL=https://your-app-url.com
+PORT=3000
